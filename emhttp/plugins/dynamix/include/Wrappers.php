@@ -9,8 +9,7 @@
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  */
-?>
-<?
+
 $docroot ??= ($_SERVER['DOCUMENT_ROOT'] ?: '/usr/local/emhttp');
 
 // pool name ending in any of these => zfs subpool
@@ -21,64 +20,80 @@ $_tilde_ = '~';
 $_proxy_ = '__';
 $_arrow_ = '&#187;';
 
-// Wrapper functions
-function file_put_contents_atomic($filename,$data) {
-  while (true) {
-    $suffix = rand();
-    if (!is_file("$filename$suffix")) break;
-  }
-  $renResult = false;
-  $writeResult = @file_put_contents("$filename$suffix",$data) === strlen($data);
-  if ($writeResult)
-    $renResult = @rename("$filename$suffix",$filename);
-  if (!$writeResult || !$renResult) {
-    my_logger("File_put_contents_atomic failed to write / rename $filename");
-    @unlink("$filename$suffix");
+/**
+ * Atomically write data to a file.
+ *
+ * @param string $filename
+ * @param string $data
+ * @return int|false Number of bytes written or false on failure.
+ */
+function file_put_contents_atomic(string $filename, string $data) {
+  $dir = dirname($filename);
+  if (!is_dir($dir)) return false;
+  $temp = tempnam($dir, basename($filename));
+  if ($temp === false) return false;
+
+  if (@file_put_contents($temp, $data) !== strlen($data)) {
+    @unlink($temp);
     return false;
   }
+
+  if (!@rename($temp, $filename)) {
+    @unlink($temp);
+    return false;
+  }
+
   return strlen($data);
 }
 
-// custom parse_ini_file/string functions to deal with '#' comment lines and remove html/php tags
-function my_parse_ini_string($text, $sections=false, $scanner=INI_SCANNER_NORMAL) {
-  return parse_ini_string(strip_tags(html_entity_decode(preg_replace('/^#.*$/m','',$text))),$sections,$scanner);
+/**
+ * Custom parse_ini_string to handle '#' comments and strip tags.
+ */
+function my_parse_ini_string($text, bool $sections = false, int $scanner = INI_SCANNER_NORMAL) {
+  if ($text === null || $text === false) return false;
+  $clean = strip_tags(html_entity_decode(preg_replace('/^#.*$/m', '', (string)$text)));
+  return parse_ini_string($clean, $sections, $scanner);
 }
 
-function my_parse_ini_file($file, $sections=false, $scanner=INI_SCANNER_NORMAL) {
-  return my_parse_ini_string(@file_get_contents($file),$sections,$scanner);
+/**
+ * Custom parse_ini_file to handle '#' comments and strip tags.
+ */
+function my_parse_ini_file(string $file, bool $sections = false, int $scanner = INI_SCANNER_NORMAL) {
+  $content = @file_get_contents($file);
+  return my_parse_ini_string($content, $sections, $scanner);
 }
 
-function parse_plugin_cfg($plugin, $sections=false, $scanner=INI_SCANNER_NORMAL) {
+/**
+ * Parse plugin configuration by merging default and custom settings.
+ */
+function parse_plugin_cfg(string $plugin, bool $sections = false, int $scanner = INI_SCANNER_NORMAL): array {
   global $docroot;
   $ram = "$docroot/plugins/$plugin/default.cfg";
   $rom = "/boot/config/plugins/$plugin/$plugin.cfg";
   
-  $cfg_ram = [];
-  if (file_exists($ram)) {
-    $cfg_ram = my_parse_ini_file($ram, $sections, $scanner);
-    if ($cfg_ram === false) {
-      my_logger("Failed to parse config file: $ram", 'webgui');
-      $cfg_ram = [];
-    }
-  }
-  $cfg_rom = [];
-  if (file_exists($rom)) {
-    $cfg_rom = my_parse_ini_file($rom, $sections, $scanner);
-    if ($cfg_rom === false) {
-      my_logger("Failed to parse config file: $rom", 'webgui');
-      $cfg_rom = [];
-    }
-  }
-  return !empty($cfg_rom) ? array_replace_recursive($cfg_ram, $cfg_rom) : $cfg_ram;
+  $cfg_ram = is_file($ram) ? (my_parse_ini_file($ram, $sections, $scanner) ?: []) : [];
+  $cfg_rom = is_file($rom) ? (my_parse_ini_file($rom, $sections, $scanner) ?: []) : [];
+
+  return array_replace_recursive($cfg_ram, $cfg_rom);
 }
 
-function parse_cron_cfg($plugin, $job, $text = "") {
+/**
+ * Update a cron job for a plugin.
+ */
+function parse_cron_cfg(string $plugin, string $job, string $text = "") {
   $cron = "/boot/config/plugins/$plugin/$job.cron";
-  if ($text) file_put_contents($cron, $text); else @unlink($cron);
+  if ($text !== "") {
+    file_put_contents($cron, $text);
+  } else {
+    @unlink($cron);
+  }
   exec("/usr/local/sbin/update_cron");
 }
 
-function agent_fullname($agent, $state) {
+/**
+ * Get the full path for a notification agent.
+ */
+function agent_fullname(string $agent, string $state): string {
   switch ($state) {
     case 'enabled' : return "/boot/config/plugins/dynamix/notifications/agents/$agent";
     case 'disabled': return "/boot/config/plugins/dynamix/notifications/agents-disabled/$agent";
@@ -86,208 +101,268 @@ function agent_fullname($agent, $state) {
   }
 }
 
-function get_plugin_attr($attr, $file) {
+/**
+ * Get an attribute from a plugin file.
+ */
+function get_plugin_attr(string $attr, string $file): ?string {
   global $docroot;
-  exec("$docroot/plugins/dynamix.plugin.manager/scripts/plugin ".escapeshellarg($attr)." ".escapeshellarg($file), $result, $error);
-  if ($error === 0) return $result[0];
+  $cmd = sprintf("%s/plugins/dynamix.plugin.manager/scripts/plugin %s %s", $docroot, escapeshellarg($attr), escapeshellarg($file));
+  exec($cmd, $result, $error);
+  return ($error === 0) ? ($result[0] ?? null) : null;
 }
 
-function plugin_update_available($plugin, $os=false) {
+/**
+ * Check if a plugin update is available.
+ */
+function plugin_update_available(string $plugin, bool $os = false): ?string {
   $local  = get_plugin_attr('version', "/var/log/plugins/$plugin.plg");
   $remote = get_plugin_attr('version', "/tmp/plugins/$plugin.plg");
-  if ($remote && strcmp($remote,$local) > 0) {
+
+  if ($remote && strcmp($remote, $local ?? '') > 0) {
     if ($os) return $remote;
-    if (!$unraid = get_plugin_attr('Unraid', "/tmp/plugins/$plugin.plg")) return $remote;
+    $unraid = get_plugin_attr('Unraid', "/tmp/plugins/$plugin.plg");
+    if (!$unraid) return $remote;
     $server = get_plugin_attr('version', "/var/log/plugins/unRAIDServer.plg");
-    if (version_compare($server, $unraid, '>=')) return $remote;
+    if (version_compare($server ?? '', $unraid, '>=')) return $remote;
   }
+  return null;
 }
 
-function _var(&$name, $key=null, $default='') {
-  return is_null($key) ? ($name ?? $default) : ($name[$key] ?? $default);
+/**
+ * Safely get a variable or array key.
+ */
+function _var(&$name, $key = null, $default = '') {
+  if (is_null($key)) return $name ?? $default;
+  return (is_array($name) && isset($name[$key])) ? $name[$key] : $default;
 }
 
 function celsius($temp) {
-  return round(($temp-32)*5/9);
+  return round(($temp - 32) * 5 / 9);
 }
 
 function fahrenheit($temp) {
-  return round(9/5*$temp)+32;
+  return round(9 / 5 * $temp) + 32;
 }
 
 function displayTemp($temp) {
   global $display;
-  return (is_numeric($temp) && _var($display,'unit') == 'F') ? fahrenheit($temp) : $temp;
+  return (is_numeric($temp) && _var($display, 'unit') == 'F') ? fahrenheit($temp) : $temp;
 }
 
 function get_value(&$name, $key, $default) {
   global $var;
   $value = $name[$key] ?? -1;
-  return $value!==-1 ? $value : ($var[$key] ?? $default);
+  return ($value !== -1) ? $value : ($var[$key] ?? $default);
 }
 
 function get_ctlr_options(&$type, &$disk) {
   if (!$type) return;
   $ports = [];
-  if (isset($disk['smPort1'])) $ports[] = $disk['smPort1'];
-  if (isset($disk['smPort2'])) $ports[] = $disk['smPort2'];
-  if (isset($disk['smPort3'])) $ports[] = $disk['smPort3'];
-  $type .= ($ports ?  ','.implode($disk['smGlue'] ?? ',',$ports) : '');
-}
-
-function port_name($port) {
-  return substr($port,-2)!='n1' ? $port : substr($port,0,-2);
-}
-
-function exceed($value, $limit, $top=100) {
-  return is_numeric($value) && $limit>0 ? ($value>$limit && $value<=$top) : false;
-}
-
-function ipaddr($ethX='eth0', $prot=4) {
-  $wlan = $ethX=='eth0' && lan_port('wlan0') && lan_port('wlan0',true);
-  switch ($prot) {
-  case 4:
-    $ipv4 = exec("ip -4 -br addr show $ethX scope global | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    if ($wlan) $ipv4 = $ipv4 ?: exec("ip -4 -br addr show wlan0 scope global | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    return $ipv4;
-  case 6:
-    $ipv6 = exec("ip -6 -br addr show $ethX scope global -temporary -deprecated | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    if ($wlan) $ipv6 = $ipv6 ?: exec("ip -6 -br addr show wlan0 scope global -temporary -deprecated | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    return $ipv6;
-  default:
-    $ipv4 = exec("ip -4 -br addr show $ethX scope global | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    $ipv6 = exec("ip -6 -br addr show $ethX scope global -temporary -deprecated | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    if ($wlan) {
-      $ipv4 = $ipv4 ?: exec("ip -4 -br addr show wlan0 scope global | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-      $ipv6 = $ipv6 ?: exec("ip -6 -br addr show wlan0 scope global -temporary -deprecated | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'");
-    }
-    return [$ipv4,$ipv6];
+  foreach (['smPort1', 'smPort2', 'smPort3'] as $p) {
+    if (isset($disk[$p])) $ports[] = $disk[$p];
+  }
+  if ($ports) {
+    $type .= ',' . implode($disk['smGlue'] ?? ',', $ports);
   }
 }
 
-function no_tilde($name) {
-  global $_tilde_ ,$_proxy_;
-  return str_replace($_tilde_,$_proxy_,$name);
+function port_name(string $port): string {
+  return (substr($port, -2) === 'n1') ? substr($port, 0, -2) : $port;
 }
 
-function prefix($key) {
-  return preg_replace('/\d+$/','',$key);
+function exceed($value, $limit, $top = 100): bool {
+  return is_numeric($value) && $limit > 0 && $value > $limit && $value <= $top;
 }
 
-function pool_name($key) {
+/**
+ * Get IP addresses for a given interface.
+ */
+function ipaddr(string $ethX = 'eth0', int $prot = 4) {
+  $wlan = ($ethX === 'eth0' && lan_port('wlan0') && lan_port('wlan0', true));
+
+  $get_ipv4 = function($iface) {
+    return exec(sprintf("ip -4 -br addr show %s scope global | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'", escapeshellarg($iface)));
+  };
+  $get_ipv6 = function($iface) {
+    return exec(sprintf("ip -6 -br addr show %s scope global -temporary -deprecated | awk '{print \$3;exit}' | sed -r 's/\/[0-9]+//'", escapeshellarg($iface)));
+  };
+
+  switch ($prot) {
+    case 4:
+      $ip = $get_ipv4($ethX);
+      return ($ip === "" && $wlan) ? $get_ipv4('wlan0') : $ip;
+    case 6:
+      $ip = $get_ipv6($ethX);
+      return ($ip === "" && $wlan) ? $get_ipv6('wlan0') : $ip;
+    default:
+      $ipv4 = $get_ipv4($ethX);
+      $ipv6 = $get_ipv6($ethX);
+      if ($wlan) {
+        $ipv4 = ($ipv4 === "") ? $get_ipv4('wlan0') : $ipv4;
+        $ipv6 = ($ipv6 === "") ? $get_ipv6('wlan0') : $ipv6;
+      }
+      return [$ipv4, $ipv6];
+  }
+}
+
+function no_tilde(string $name): string {
+  global $_tilde_, $_proxy_;
+  return str_replace($_tilde_, $_proxy_, $name);
+}
+
+function prefix(string $key): string {
+  return preg_replace('/\d+$/', '', $key);
+}
+
+function pool_name(string $key): string {
   return preg_replace('/(\d+$|~.*$)/', '', $key);
 }
 
-function native($name, $full=0) {
+function native(string $name, int $full = 0): string {
   global $_tilde_, $_arrow_;
   switch ($full) {
-    case 0: return str_replace($_tilde_," $_arrow_ ",$name);
-    case 1: return strpos($name,$_tilde_)!==false ? "$_arrow_ ".explode($_tilde_,$name)[1] : $name;
+    case 0: return str_replace($_tilde_, " $_arrow_ ", $name);
+    case 1:
+      $parts = explode($_tilde_, $name);
+      return (count($parts) > 1) ? "$_arrow_ " . $parts[1] : $name;
+    default: return $name;
   }
 }
 
-function isSubpool($name) {
+function isSubpool(string $name) {
   global $subpools, $_tilde_;
-  $subpool = my_explode($_tilde_,$name)[1];
-  return in_array($subpool,$subpools) ? $subpool : false;
+  $parts = explode($_tilde_, $name);
+  if (count($parts) < 2) return false;
+  return in_array($parts[1], $subpools) ? $parts[1] : false;
 }
 
-function get_nvme_info($device, $info) {
+/**
+ * Get NVMe specific information.
+ */
+function get_nvme_info(string $device, string $info) {
+  $dev = escapeshellarg("/dev/$device");
   switch ($info) {
-  case 'temp':
-    exec("nvme id-ctrl /dev/$device 2>/dev/null | grep -Pom2 '^[wc]ctemp +: \K\d+'",$temp);
-    return count($temp) >= 2 ? [$temp[0]-273, $temp[1]-273] : [0, 0];
-  case 'cctemp':
-    return exec("nvme id-ctrl /dev/$device 2>/dev/null | grep -Pom1 '^cctemp +: \K\d+'")-273;
-  case 'wctemp':
-    return exec("nvme id-ctrl /dev/$device 2>/dev/null | grep -Pom1 '^wctemp +: \K\d+'")-273;
-  case 'state':
-    $state = exec("nvme get-feature /dev/$device -f2 2>/dev/null | grep -Pom1 'value:.+\K.$'");
-    return exec("nvme id-ctrl /dev/$device 2>/dev/null | grep -Pom1 '^ps +$state : mp:\K\S+ \S+'");
-  case 'power':
-    $state = exec("nvme get-feature /dev/$device -f2 2>/dev/null | grep -Pom1 'value:.+\K.$'");
-    return exec("smartctl -c /dev/$device 2>/dev/null | grep -Pom1 '^ *$state [+-] +\K[^W]+'");
+    case 'temp':
+      exec("nvme id-ctrl $dev 2>/dev/null | grep -Pom2 '^[wc]ctemp +: \K\d+'", $temp);
+      return (count($temp) >= 2) ? [$temp[0] - 273, $temp[1] - 273] : [0, 0];
+    case 'cctemp':
+      $val = exec("nvme id-ctrl $dev 2>/dev/null | grep -Pom1 '^cctemp +: \K\d+'");
+      return is_numeric($val) ? (int)$val - 273 : 0;
+    case 'wctemp':
+      $val = exec("nvme id-ctrl $dev 2>/dev/null | grep -Pom1 '^wctemp +: \K\d+'");
+      return is_numeric($val) ? (int)$val - 273 : 0;
+    case 'state':
+      $state = exec("nvme get-feature $dev -f2 2>/dev/null | grep -Pom1 'value:.+\K.$'");
+      return exec("nvme id-ctrl $dev 2>/dev/null | grep -Pom1 '^ps +$state : mp:\K\S+ \S+'");
+    case 'power':
+      $state = exec("nvme get-feature $dev -f2 2>/dev/null | grep -Pom1 'value:.+\K.$'");
+      return exec("smartctl -c $dev 2>/dev/null | grep -Pom1 '^ *$state [+-] +\K[^W]+'");
+    default:
+      return null;
   }
 }
 
-// convert strftime to date format
-function my_date($fmt, $time) {
-  $legacy = ['%c' => 'D j M Y h:i A','%A' => 'l','%Y' => 'Y','%B' => 'F','%e' => 'j','%d' => 'd','%m' => 'm','%I' => 'h','%H' => 'H','%M' => 'i','%S' => 's','%p' => 'a','%R' => 'H:i', '%F' => 'Y-m-d', '%T' => 'H:i:s'];
-  return date(strtr($fmt,$legacy), $time);
-}
-
-// ensure params passed to logger are properly escaped
-function my_logger($message, $logger='webgui') {
-  exec('logger -t '.escapeshellarg($logger).' -- '.escapeshellarg($message));
-}
-
-// Original PHP code by Chirp Internet: www.chirpinternet.eu
-// Please acknowledge use of this code by including this header.
-// https://www.the-art-of-web.com/php/http-get-contents/
-// Modified for Unraid
 /**
- * Fetches URL and returns content
- * @param string $url The URL to fetch
- * @param array $opts Array of options to pass to curl_setopt()
- * @param ?array $getinfo Empty array passed by reference, will contain results of curl_getinfo and curl_error, or null if not needed
- * @return string|false $out The fetched content
+ * Convert strftime-style format to PHP date() format.
  */
-function http_get_contents(string $url, array $opts=[], ?array &$getinfo=NULL) {
+function my_date(string $fmt, int $time): string {
+  $legacy = [
+    '%c' => 'D j M Y h:i A', '%A' => 'l', '%Y' => 'Y', '%B' => 'F',
+    '%e' => 'j', '%d' => 'd', '%m' => 'm', '%I' => 'h', '%H' => 'H',
+    '%M' => 'i', '%S' => 's', '%p' => 'a', '%R' => 'H:i',
+    '%F' => 'Y-m-d', '%T' => 'H:i:s'
+  ];
+  return date(strtr($fmt, $legacy), $time);
+}
+
+/**
+ * Log a message to the system log.
+ */
+function my_logger(string $message, string $logger = 'webgui') {
+  exec('logger -t ' . escapeshellarg($logger) . ' -- ' . escapeshellarg($message));
+}
+
+/**
+ * Fetches URL and returns content using cURL.
+ */
+function http_get_contents(string $url, array $opts = [], ?array &$getinfo = null) {
   $ch = curl_init();
-  if (isset($getinfo))
-    curl_setopt($ch, CURLINFO_HEADER_OUT, true);
-  curl_setopt($ch, CURLOPT_URL, $url);
-  curl_setopt($ch, CURLOPT_FRESH_CONNECT, true);
-  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-  curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
-  curl_setopt($ch, CURLOPT_TIMEOUT, 45);
-  curl_setopt($ch, CURLOPT_ENCODING, "");
-  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-  curl_setopt($ch, CURLOPT_REFERER, "");
-  curl_setopt($ch, CURLOPT_FAILONERROR, true);
-  curl_setopt($ch, CURLOPT_USERAGENT, 'Unraid');
-  if (is_array($opts) && count($opts) > 0) {
+  if (isset($getinfo)) curl_setopt($ch, CURLINFO_HEADER_OUT, true);
+
+  curl_setopt_array($ch, [
+    CURLOPT_URL => $url,
+    CURLOPT_FRESH_CONNECT => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_CONNECTTIMEOUT => 15,
+    CURLOPT_TIMEOUT => 45,
+    CURLOPT_ENCODING => "",
+    CURLOPT_FOLLOWLOCATION => true,
+    CURLOPT_REFERER => "",
+    CURLOPT_FAILONERROR => true,
+    CURLOPT_USERAGENT => 'Unraid',
+  ]);
+
+  if (!empty($opts)) {
     foreach ($opts as $key => $val) {
       curl_setopt($ch, $key, $val);
     }
   }
+
   $out = curl_exec($ch);
-  if (curl_errno($ch) == 23) {
-    // error 23 detected, try CURLOPT_ENCODING = "deflate"
+
+  if (curl_errno($ch) === 23) { // CURLE_WRITE_ERROR
     curl_setopt($ch, CURLOPT_ENCODING, "deflate");
     $out = curl_exec($ch);
   }
+
   if (isset($getinfo)) {
     $getinfo = curl_getinfo($ch);
   }
+
   if ($errno = curl_errno($ch)) {
-    $msg = "Curl error $errno: ".(curl_error($ch) ?: curl_strerror($errno)).". Requested url: '$url'";
-    if (isset($getinfo)) {
-      $getinfo['error'] = $msg;
-    }
+    $msg = "Curl error $errno: " . (curl_error($ch) ?: curl_strerror($errno)) . ". Requested url: '$url'";
+    if (isset($getinfo)) $getinfo['error'] = $msg;
     my_logger($msg, "http_get_contents");
   }
+
   curl_close($ch);
   return $out;
 }
 
 /**
- * Detect network connectivity via Network Connectivity Status Indicator
- * @return bool
+ * Detect network connectivity.
  */
 function check_network_connectivity(): bool {
   $url = 'http://www.msftncsi.com/ncsi.txt';
   $out = http_get_contents($url);
-  return ($out=="Microsoft NCSI");
+  return ($out === "Microsoft NCSI");
 }
 
-function lan_port($port, $state=false) {
-  $system = '/sys/class/net';
-  $exist = file_exists("$system/$port");
-  return !$state ? $exist : ($exist ? (@file_get_contents("$system/$port/carrier") ?: 0) : false);
+/**
+ * Check if a LAN port exists and optionally its link state.
+ */
+function lan_port(string $port, bool $state = false) {
+  $path = "/sys/class/net/" . basename($port);
+  $exist = is_dir($path);
+  if (!$state) return $exist;
+  if (!$exist) return false;
+  $carrier = @file_get_contents("$path/carrier");
+  return ($carrier !== false) ? (int)trim($carrier) : 0;
 }
 
-function shieldarg(...$args) {
+/**
+ * Escape multiple arguments for shell use.
+ */
+function shieldarg(...$args): string {
   return implode(' ', array_map('escapeshellarg', $args));
+}
+
+/**
+ * Helper to split string into padded array.
+ */
+if (!function_exists('my_explode')) {
+function my_explode(string $split, ?string $text, int $count = 2): array {
+  return array_pad(explode($split, $text ?? "", $count), $count, '');
+}
 }
 ?>
