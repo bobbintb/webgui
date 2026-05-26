@@ -1,6 +1,6 @@
 <?PHP
-/* Copyright 2005-2023, Lime Technology
- * Copyright 2012-2023, Bergware International.
+/* Copyright 2005-2025, Lime Technology
+ * Copyright 2012-2025, Bergware International.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version 2,
@@ -9,148 +9,221 @@
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  */
-?>
-<?
+
 require_once "$docroot/webGui/include/MarkdownExtra.inc.php";
 require_once "$docroot/webGui/include/Wrappers.php";
 
-function get_ini_key($key,$default) {
+/**
+ * Get a value from an ini-style variable.
+ * Note: Still uses eval for complex keys, but wrapped in safety.
+ */
+function get_ini_key(string $key, $default) {
+  if (strpos($key, '$') !== 0) return $default;
   $x = strpos($key, '[');
-  $var = $x>0 ? substr($key,1,$x-1) : substr($key,1);
-  global $$var;
+  $var_name = ($x > 0) ? substr($key, 1, $x - 1) : substr($key, 1);
+
+  global $$var_name;
+  if (!isset($$var_name)) return $default;
+
   try {
-    eval("\$var=$key;");
+    // Basic validation to avoid arbitrary code execution
+    if (preg_match('/^\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*(\[[\'"]?[a-zA-Z0-9_\x7f-\xff]+[\'"]?\])*$/', $key)) {
+      $val = null;
+      @eval("\$val = $key;");
+      return $val ?? $default;
+    }
   } catch (Throwable $e) {
-    return $default;
+    // Fallback to default on error
   }
-  return $var ?: $default;
+  return $default;
 }
 
-function get_file_key($file,$default) {
-  [$key, $default] = my_explode('=',$default);
-  $var = @parse_ini_file($file);
-  return $var[$key] ?? $default;
+/**
+ * Get a value from an ini file.
+ */
+function get_file_key(string $file, string $default) {
+  [$key, $def_val] = my_explode('=', $default);
+  $ini = @parse_ini_file($file);
+  return $ini[$key] ?? $def_val;
 }
 
-function build_pages($pattern) {
+/**
+ * Scan a directory for .page files and build the site structure.
+ */
+function build_pages(string $pattern): void {
   global $site;
-  foreach (glob($pattern,GLOB_NOSORT) as $entry) {
-    [$header, $content] = my_explode("\n---\n",file_get_contents($entry));
+  $files = glob($pattern, GLOB_NOSORT);
+  if ($files === false) return;
+
+  foreach ($files as $entry) {
+    $content = @file_get_contents($entry);
+    if ($content === false) continue;
+
+    [$header, $text] = my_explode("\n---\n", $content);
     $page = @parse_ini_string($header);
-    if (!$page) {my_logger("Invalid .page format: $entry"); continue;}
+    if (!$page) {
+      my_logger("Invalid .page format: $entry");
+      continue;
+    }
+
     $page['file'] = $entry;
     $page['root'] = dirname($entry);
     $page['name'] = basename($entry, '.page');
-    $page['text'] = $content;
+    $page['text'] = $text;
     $site[$page['name']] = $page;
   }
 }
 
-function page_enabled(&$page)
-{
-  global $docroot,$var,$disks,$devs,$users,$shares,$sec,$sec_nfs,$name,$display,$pool_devices;
-  $enabled = $evalSuccess = true;
-  if (isset($page['Cond'])) {
-    $evalContent= "\$enabled={$page['Cond']};";
-    $evalFile = $page['file'];
-    include "$docroot/webGui/include/DefaultPageLayout/evalContent.php";
+/**
+ * Check if a page is enabled based on its Cond attribute.
+ */
+function page_enabled(array &$page): bool {
+  global $docroot, $var, $disks, $devs, $users, $shares, $sec, $sec_nfs, $name, $display, $pool_devices;
+  if (!isset($page['Cond'])) return true;
+
+  $enabled = true;
+  $evalSuccess = true;
+  $evalContent = "\$enabled = {$page['Cond']};";
+  $evalFile = $page['file'];
+
+  // Using include for evalContent.php as per original design for variable scope access
+  $eval_path = "$docroot/webGui/include/DefaultPageLayout/evalContent.php";
+  if (is_file($eval_path)) {
+    include $eval_path;
+  } else {
+    // Fallback if file missing
+    try {
+      @eval($evalContent);
+    } catch (Throwable $e) {
+      $evalSuccess = false;
+    }
   }
+
   return ($enabled && $evalSuccess);
 }
 
-function find_pages($item) {
+/**
+ * Find pages that belong to a specific menu item.
+ */
+function find_pages(string $item): array {
   global $site;
   $pages = [];
-  foreach ($site as $page) {
+  foreach (($site ?? []) as $page) {
     if (empty($page['Menu'])) continue;
-    $menu = strtok($page['Menu'], ' ');
-    switch ($menu[0]) {
-      case '$': $menu = get_ini_key($menu,strtok(' ')); break;
-      case '/': $menu = get_file_key($menu,strtok(' ')); break;
+
+    $menu_str = $page['Menu'];
+    $first_word = strtok($menu_str, ' ');
+    $menu_id = $first_word;
+
+    if ($first_word[0] === '$') {
+      $menu_id = get_ini_key($first_word, strtok(' '));
+    } elseif ($first_word[0] === '/') {
+      $menu_id = get_file_key($first_word, strtok(' '));
     }
-    while ($menu !== false) {
-      [$menu,$rank] = my_explode(':',$menu);
-      if ($menu == $item) {
-        if (page_enabled($page)) $pages["$rank{$page['name']}"] = $page;
+
+    while ($menu_id !== false) {
+      [$m, $rank] = my_explode(':', (string)$menu_id);
+      if ($m === $item) {
+        if (page_enabled($page)) {
+          $pages["$rank{$page['name']}"] = $page;
+        }
         break;
       }
-      $menu = strtok(' ');
+      $menu_id = strtok(' ');
     }
   }
-  ksort($pages,SORT_NATURAL);
+  ksort($pages, SORT_NATURAL);
   return $pages;
 }
 
-function tab_title($title,$path,$tag) {
-  global $docroot,$pools;
-  $title=htmlspecialchars(html_entity_decode($title));
-  $names = implode('|',array_merge(['disk','parity'],$pools));
-  if (preg_match("/^($names)/",$title)) {
-    $device = strtok($title,' ');
-    $title = str_replace($device,_(my_disk($device),3),$title);
+/**
+ * Generate HTML for a tab title.
+ */
+function tab_title(string $title, string $path, ?string $tag): string {
+  global $docroot, $pools;
+  $title = htmlspecialchars(html_entity_decode($title));
+
+  $assigned_pools = $pools ?? [];
+  $device_names = implode('|', array_merge(['disk', 'parity'], $assigned_pools));
+
+  if (preg_match("/^($device_names)/", $title)) {
+    $device = strtok($title, ' ');
+    $translated_disk = _(my_disk($device), 3);
+    $title = str_replace($device, $translated_disk, $title);
   }
-  $title = _(parse_text($title));
-  $wrapperClasses = 'left inline-flex flex-row items-center gap-1';
-  if (!$tag || substr($tag,-4)=='.png') {
-    $file = "$path/icons/".($tag ?: strtolower(str_replace(' ','',$title)).".png");
-    if (file_exists("$docroot/$file")) {
-      return "<span class='$wrapperClasses'><img src='/$file' class='icon' style='max-width: 18px; max-height: 18px; width: auto; height: auto; object-fit: contain;'>$title</span>";
-    } else {
-      return "<span class='$wrapperClasses'><i class='fa fa-th title'></i>$title</span>";
-    }
-  } elseif (substr($tag,0,5)=='icon-') {
-    return "<span class='$wrapperClasses'><i class='$tag title'></i>$title</span>";
+
+  // parse_text is assumed to be defined globally
+  if (function_exists('parse_text')) {
+    $title = _(parse_text($title));
   } else {
-    if (substr($tag,0,3)!='fa-') $tag = "fa-$tag";
-    return "<span class='$wrapperClasses'><i class='fa $tag title'></i>$title</span>";
+    $title = _($title);
+  }
+
+  $wrapperClasses = 'left inline-flex flex-row items-center gap-1';
+
+  if (!$tag || substr($tag, -4) === '.png') {
+    $icon_name = $tag ?: strtolower(str_replace(' ', '', $title)) . ".png";
+    $icon_path = "$path/icons/$icon_name";
+    if (is_file("$docroot/$icon_path")) {
+      return "<span class='$wrapperClasses'><img src='/$icon_path' class='icon' style='max-width: 18px; max-height: 18px; width: auto; height: auto; object-fit: contain;'>$title</span>";
+    }
+    return "<span class='$wrapperClasses'><i class='fa fa-th title'></i>$title</span>";
+  }
+
+  if (strpos($tag, 'icon-') === 0) {
+    return "<span class='$wrapperClasses'><i class='$tag title'></i>$title</span>";
+  }
+
+  $fa_tag = (strpos($tag, 'fa-') === 0) ? $tag : "fa-$tag";
+  return "<span class='$wrapperClasses'><i class='fa $fa_tag title'></i>$title</span>";
+}
+
+/**
+ * Generate CSS for sidebar icons.
+ */
+function generate_sidebar_icon_css(array $tasks, array $buttons): string {
+  $css = '';
+  foreach ($tasks as $page) {
+    if (isset($page['Code'])) {
+      $css .= ".nav-item a[href='/{$page['name']}']:before{content:'\\" . htmlspecialchars($page['Code']) . "'}\n";
+    }
+  }
+  $css .= ".nav-item.LockButton a:before{content:'\\e955'}\n";
+  foreach ($buttons as $page) {
+    if (isset($page['Code'])) {
+      $css .= ".nav-item.{$page['name']} a:before{content:'\\" . htmlspecialchars($page['Code']) . "'}\n";
+    }
+  }
+  return $css;
+}
+
+/**
+ * Include stylesheets for a page.
+ */
+function includePageStylesheets(array $page): void {
+  global $docroot, $theme;
+  $base_path = "/{$page['root']}/sheets/{$page['name']}";
+
+  $files = ["$base_path.css"];
+  if ($theme) $files[] = "{$base_path}-{$theme}.css";
+
+  foreach ($files as $f) {
+    if (is_file($docroot . $f)) {
+      echo '<link type="text/css" rel="stylesheet" href="', autov($f), '">', "\n";
+    }
   }
 }
 
 /**
- * Generate CSS for sidebar icons
- * 
- * @param array $tasks Array of task pages
- * @param array $buttons Array of button pages
- * @return string CSS for sidebar icons
+ * Output an HTML comment for debugging.
  */
-function generate_sidebar_icon_css($tasks, $buttons) {
-  $css = '';
-
-  // Generate CSS for task icons
-  foreach ($tasks as $button) {
-    if (isset($button['Code'])) {
-      $css .= ".nav-item a[href='/{$button['name']}']:before{content:'\\{$button['Code']}'}\n";
-    }
-  }
-
-  // Add lock button icon
-  $css .= ".nav-item.LockButton a:before{content:'\\e955'}\n";
-
-  // Generate CSS for utility button icons
-  foreach ($buttons as $button) {
-    if (isset($button['Code'])) {
-      $css .= ".nav-item.{$button['name']} a:before{content:'\\{$button['Code']}'}\n";
-    }
-  }
-
-  return $css;
+function annotate(string $text): void {
+  $text = htmlspecialchars($text);
+  $line = str_repeat("#", strlen($text));
+  echo "\n<!--\n$line\n$text\n$line\n-->\n";
 }
 
-function includePageStylesheets($page) {
-  global $docroot, $theme;
-  $css = "/{$page['root']}/sheets/{$page['name']}";
-  $css_stock = "$css.css";
-  $css_theme = "$css-$theme.css"; // @todo add syslog for deprecation notice
-  if (is_file($docroot.$css_stock)) echo '<link type="text/css" rel="stylesheet" href="',autov($css_stock),'">',"\n";
-  if (is_file($docroot.$css_theme)) echo '<link type="text/css" rel="stylesheet" href="',autov($css_theme),'">',"\n";
-}
-
-function annotate($text) {
-  echo "\n<!--\n",str_repeat("#",strlen($text)),"\n$text\n",str_repeat("#",strlen($text)),"\n-->\n";
-}
-
-// hack to embed function output in a quoted string (e.g., in a page Title)
-// see: http://stackoverflow.com/questions/6219972/why-embedding-functions-inside-of-strings-is-different-than-variables
-function _func($x) {return $x;}
+// Helper to embed function output in strings.
+function _func($x) { return $x; }
 $func = '_func';
 ?>
